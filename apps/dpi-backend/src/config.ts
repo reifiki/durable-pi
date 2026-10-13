@@ -13,9 +13,20 @@ export interface BackendConfig {
   envFile: string;
   dataDir: string;
   startDirs: string[];
-  provider: "openrouter" | "faux";
+  provider: "openrouter" | "nvidia" | "faux";
+  defaultModel: string;
   token: string;
 }
+
+const PROVIDERS = ["openrouter", "nvidia", "faux"] as const;
+type Provider = (typeof PROVIDERS)[number];
+
+const resolveProvider = (raw: string | undefined): Provider => {
+  const value = (raw ?? "openrouter").trim().toLowerCase();
+  const found = PROVIDERS.find((p) => p === value);
+  if (!found) throw Error(`Unknown DPI_PROVIDER "${raw}". Use one of: ${PROVIDERS.join(", ")}`);
+  return found;
+};
 
 const expand = (p: string) => (p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
@@ -41,7 +52,8 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): Bac
       .split(":")
       .filter(Boolean)
       .map((p) => resolve(expand(p))),
-    provider: (env.DPI_PROVIDER ?? "openrouter") === "faux" ? "faux" : "openrouter",
+    provider: resolveProvider(env.DPI_PROVIDER),
+    defaultModel: flag("--default-model", env.DPI_DEFAULT_MODEL ?? ""),
     token: env.DPI_TOKEN ?? "",
   };
   if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535)

@@ -39,6 +39,7 @@ import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
+import { nvidiaProvider } from "@earendil-works/pi-ai/providers/nvidia";
 import { curatedModels, defaultModelId } from "./model-catalog.js";
 import { fauxModels, installFaux } from "./faux.js";
 import {
@@ -90,7 +91,9 @@ export interface StoreOptions {
   dataDir: string;
   startDirs: string[];
   name: string;
-  provider: "openrouter" | "faux";
+  provider: "openrouter" | "nvidia" | "faux";
+  /** Only for provider "nvidia": overrides the free default model. */
+  defaultModel?: string;
 }
 
 /** Agent documents a client may read or stream, by kind. */
@@ -140,8 +143,15 @@ const decodeCursor = (cursor?: string) => {
   }
 };
 
+type CatalogModel = ReturnType<ReturnType<typeof nvidiaProvider>["getModels"]>[number];
+const isFree = (m: CatalogModel) => m.cost.input === 0 && m.cost.output === 0;
+/** Free default when the device runs on NVIDIA: agentic, 1M context, zero cost. */
+const NVIDIA_DEFAULT = "moonshotai/kimi-k3";
+
 export class Store {
   readonly models = createModels();
+  /** Ids of the zero-cost NVIDIA models, empty on every other provider. */
+  private freeNvidia: string[] = [];
   readonly opened = new Map<string, Opened>();
   readonly errors = new Map<string, string>();
   readonly catalog: DatabaseSync;
@@ -178,7 +188,19 @@ export class Store {
 
   private constructor(readonly options: StoreOptions) {
     if (options.provider === "faux") installFaux(this.models);
-    else {
+    else if (options.provider === "nvidia") {
+      // NVIDIA ships a catalog; only the zero-cost models are offered, so a device
+      // on this provider never spends money without being reconfigured.
+      const provider = nvidiaProvider();
+      const free = provider.getModels().filter(isFree);
+      if (!free.length) throw Error("NVIDIA catalog has no zero-cost models");
+      this.freeNvidia = free.map((m) => m.id);
+      this.models.setProvider({ ...provider, getModels: () => free });
+      if (options.defaultModel && !free.some((m) => m.id === options.defaultModel))
+        throw Error(
+          `DPI_DEFAULT_MODEL "${options.defaultModel}" is not a free NVIDIA model. Choose one of: ${this.freeNvidia.join(", ")}`,
+        );
+    } else {
       const provider = openrouterProvider();
       const catalog = provider.getModels();
       for (const model of curatedModels)
@@ -264,7 +286,9 @@ export class Store {
   }
 
   private defaultModel() {
-    return this.options.provider === "faux" ? fauxModels[0].id : defaultModelId;
+    if (this.options.provider === "faux") return fauxModels[0].id;
+    if (this.options.provider === "nvidia") return this.options.defaultModel || NVIDIA_DEFAULT;
+    return defaultModelId;
   }
 
   private async loadModels(): Promise<ModelInfo[]> {
@@ -279,6 +303,21 @@ export class Store {
         reasoning: false,
         cost: { input: 0, output: 0 },
       }));
+    if (this.options.provider === "nvidia") {
+      const available = await this.models.getAvailable("nvidia", { signal: AbortSignal.timeout(10000) });
+      return available
+        .filter((m) => this.freeNvidia.includes(m.id))
+        .map((m) => ({
+          id: m.id,
+          provider: "nvidia",
+          name: m.name,
+          tier: m.id === this.defaultModel() ? "S+" : "T",
+          icon: "nvidia.png",
+          contextWindow: m.contextWindow,
+          reasoning: m.reasoning,
+          cost: { input: m.cost.input, output: m.cost.output },
+        }));
+    }
     const available = await this.models.getAvailable("openrouter", { signal: AbortSignal.timeout(10000) });
     return curatedModels.flatMap((c) => {
       const m = available.find((m) => m.id === c.id);
@@ -304,6 +343,10 @@ export class Store {
       const id = fauxModels.some((m) => m.id === model?.modelId) ? model!.modelId : fauxModels[0].id;
       return { provider: "faux", modelId: id };
     }
+    if (this.options.provider === "nvidia") {
+      const id = model?.provider === "nvidia" ? model.modelId : `${model?.provider}/${model?.modelId ?? ""}`;
+      return { provider: "nvidia", modelId: this.freeNvidia.includes(id) ? id : this.defaultModel() };
+    }
     const exact = model?.provider === "openrouter" ? model.modelId : `${model?.provider}/${model?.modelId}`;
     return {
       provider: "openrouter",
@@ -318,9 +361,13 @@ export class Store {
     const known =
       this.options.provider === "faux"
         ? m.provider === "faux" && fauxModels.some((f) => f.id === m.modelId)
-        : m.provider === "openrouter" &&
-          curatedModels.some((c) => c.id === m.modelId) &&
-          !!this.models.getModel(m.provider, m.modelId);
+        : this.options.provider === "nvidia"
+          ? m.provider === "nvidia" &&
+            this.freeNvidia.includes(m.modelId) &&
+            !!this.models.getModel(m.provider, m.modelId)
+          : m.provider === "openrouter" &&
+            curatedModels.some((c) => c.id === m.modelId) &&
+            !!this.models.getModel(m.provider, m.modelId);
     if (!known) throw invalid(`Unknown model ${m.provider}/${m.modelId}. Choose one from GET /v1/device models`);
     return { provider: m.provider, modelId: m.modelId };
   }
